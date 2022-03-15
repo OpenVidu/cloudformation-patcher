@@ -1,0 +1,202 @@
+#!/bin/bash
+set -eu -o pipefail
+
+fatal_error() {
+     printf "\n==================="
+     printf "\n[ERROR]  %s" "$1"
+     printf "\n"
+     exit 1
+}
+
+embed_newline()
+{
+   local p="$1"
+   shift
+   for i in "$@"
+   do
+      p="$p\n$i"
+   done
+   echo -e "$p"
+}
+
+print_usage() {
+    printf "Usage: cloudformation_patcher [arguments]"
+    printf "\nExample: ./cloudformation_patcher --original <path_to_file> --patch <path_to_file> --output <path_to_file>"
+    printf "\n"
+}
+
+
+
+if ! [[ -x "$(command -v yq)" ]]; then
+  fatal_error 'You need to install yq: https://github.com/mikefarah/yq'
+  exit 1
+fi
+
+#################################
+#       Read arguments          #
+#################################
+for arg in "$@"; do
+  shift
+  case "$arg" in
+    "--original") set -- "$@" "-f" ;;
+    "--patch") set -- "$@" "-p" ;;
+    "--output")   set -- "$@" "-o" ;;
+    *)        set -- "$@" "$arg"
+  esac
+done
+ORIGINAL=""
+PATCH=""
+OUTPUT=""
+while getopts f:p:o: flag
+do
+    case "${flag}" in
+        f) ORIGINAL=${OPTARG};;
+        p) PATCH=${OPTARG};;
+        o) OUTPUT=${OPTARG};;
+        "?") print_usage >&2; exit 1 ;;
+    esac
+done
+if [[ -z "${ORIGINAL}" ]] || [[ -z "${PATCH}" ]] || [[ -z "${OUTPUT}" ]]; then
+  printf "Error: Missing arguments\n\n"
+  print_usage;
+  exit 1
+fi
+
+#################################
+#       Init script             #
+#################################
+echo "Patching Original file ${ORIGINAL} with ${PATCH} to ${OUTPUT}"
+patch_yaml=$(cat "${PATCH}")
+final_yaml=$(cat "${ORIGINAL}")
+num_ops=$(echo "${patch_yaml}" | yq '.Patches | length')
+
+
+for ((i=0; i < num_ops; i++)); do
+
+  #################################
+  #    Reading patch operations   #
+  #################################
+  export location
+  export content
+  export content_orig_json
+  entry=$(echo "${patch_yaml}" | yq ".Patches[$i]")
+  operation="none"
+  if [[ $(echo "$entry" | yq e 'has("AddOrUpdate")') == "true" ]]; then
+    operation="AddOrUpdate"
+  elif [[ $(echo "$entry" | yq e 'has("Remove")') == "true" ]]; then
+    operation="Remove"
+  elif [[ $(echo "$entry" | yq e 'has("Modify")') == "true" ]]; then
+    operation="Modify"
+  elif [[ $(echo "$entry" | yq e 'has("Concat")') == "true" ]]; then
+    operation="Concat"
+  else
+    operation="none"
+  fi
+  if [[ "${operation}" == "none" ]]; then
+    bad_entry=$(echo "${entry}" | yq --prettyPrint)
+    printf "\n====Invalid-Entry====\n%s\n=====================\n" "${bad_entry}"
+    fatal_error "Operation not allowed"
+  fi
+
+
+
+  #################################
+  #    Executing operations       #
+  #################################
+  case "${operation}" in
+
+
+    #----------------------
+    #    AddOrUpdate
+    #----------------------
+    "AddOrUpdate")
+      location="$(echo "$entry" | yq '.AddOrUpdate.Location')"
+      # Replace quotes to not be interpreted
+      content="$(echo "$entry" | yq '.AddOrUpdate.Content')"
+
+      # Get tag for Cloudformation special functions
+      tag="$(echo "${entry}" | yq '.AddOrUpdate.Content | tag')"
+
+      # Convert to json to get real type
+      content_json="$(echo "${entry}" | yq -o=json '.AddOrUpdate.Content')"
+      type=$(echo "${content_json}" | yq 'tag')
+
+      # Remove original tag
+      orig_tag="$(echo "${final_yaml}" | yq 'eval(strenv(location)) | tag')"
+      # Set tag to !None if !! not found
+      if [[ "${orig_tag}" != "!!"* ]]; then
+        final_yaml="$(echo "${final_yaml}" | yq eval "${location} tag = \"!None\"")"
+        # Replace !None to Empty
+        final_yaml="${final_yaml//!None/}"
+      fi
+
+      if [[ "${type}" == "!!map" ]] || [[ "${type}" == "!!seq" ]]; then
+        final_yaml="$(echo "${final_yaml}" | yq 'eval(strenv(location)) = env(content)')"
+      else
+          # Replace quotes to not be interpreted
+          content="$(echo "$entry" | yq '.AddOrUpdate.Content' | sed -e 's,\",\\",g')"
+          if [[ "${type}" == "!!int" ]] || [[ "${type}" == "!!float" ]] || [[ "${type}" == "!!bool" ]]; then
+            final_yaml="$(echo "${final_yaml}" | yq eval "${location} = ${content}")"
+          else
+            final_yaml="$(echo "${final_yaml}" | yq eval "${location} = \"${content}\"")"
+          fi
+          if [[ "${tag}" != "!!"* ]]; then
+            # Add custom tags...
+            final_yaml="$(echo "${final_yaml}" | yq eval "${location} tag = \"${tag}\"")"
+          fi
+      fi
+      echo "[OK]  Added Or Updated element: '${location}'"
+      ;;
+
+
+
+    #----------------------
+    #    Remove
+    #----------------------
+    "Remove")
+      location="$(echo "$entry" | yq '.Remove.Location')"
+      final_yaml="$(echo "${final_yaml}" | yq 'del(eval(strenv(location)))')"
+      echo "[OK]  Removed Element: '${location}'"
+      ;;
+
+
+    #----------------------
+    #    Concat
+    #----------------------
+    "Concat")
+      location="$(echo "$entry" | yq '.Concat.Location')"
+      # Replace quotes to not be interpreted
+      content="$(echo "$entry" | yq '.Concat.Content')"
+
+      # Convert to json to get real type
+      content_json="$(echo "${entry}" | yq -o=json '.Concat.Content')"
+      type=$(echo "${content_json}" | yq 'tag')
+      if [[ "${type}" == "!!str" ]]; then
+        current_value="$(echo "${final_yaml}" | yq 'eval(strenv(location))')"
+        newline="$(echo "$entry" | yq '.Concat.NewLine')"
+        content="$(echo "$entry" | yq '.Concat.Content')"
+        if [[ "${newline}" == "true" ]]; then
+          content="$(embed_newline "${current_value}" "${content}")"
+        elif [[ "${newline}" == "false" ]]; then
+          content="${current_value}""${content}"
+        else
+          fatal_error "Concat.NewLine must be a boolean"
+        fi
+        final_yaml="$(echo "${final_yaml}" | yq 'eval(strenv(location)) = strenv(content)')"
+      else
+        fatal_error "Concat.content should be of string type"
+      fi
+      echo "[OK]  Concat new content at: '${location}'"
+      ;;
+  esac
+
+
+done
+
+#################################
+#    Post Processing and save   #
+#################################
+final_yaml="$(echo "${final_yaml}" | sed '/^[[:space:]]*$/d' | sed 's,|-,|,g')"
+
+echo "${final_yaml}" > "${OUTPUT}"
+chown 1000:1000 "${OUTPUT}"

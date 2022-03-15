@@ -1,0 +1,11 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Example
+Resources:
+  ConfidentialBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: PublicRead
+  NotUsefulBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: PublicRead

@@ -1,0 +1,21 @@
+Patches:
+  # ================
+  # Change 'Confidential' bucket to private
+  # ================
+  - AddOrUpdate:
+      Location: .Resources.ConfidentialBucket.Properties.AccessControl
+      Content: Private
+  # ================
+  # Create new bucket: 'NewBucket'
+  # ================
+  - AddOrUpdate:
+      Location: .Resources.NewBucket
+      Content:
+        Type: AWS::S3::Bucket
+        Properties:
+          AccessControl: PublicRead
+  # ================
+  # Remove 'NotUsefulBucket'
+  # ================
+  - Remove:
+      Location: .Resources.NotUsefulBucket
