@@ -1,5 +1,8 @@
 # Cloudformation patcher
 
+> [!WARNING]
+> **This repository is no longer maintained.**
+
 This tool allows to generate Cloudformations based on:
 
 - A **Cloudformation file**
